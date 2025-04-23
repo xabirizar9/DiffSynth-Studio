@@ -1,0 +1,23 @@
+[project]
+name = "diffsynth-studio"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "controlnet-aux==0.0.7",
+    "cupy-cuda12x>=13.4.1",
+    "datasets>=3.5.0",
+    "einops>=0.8.1",
+    "ftfy>=6.3.1",
+    "imageio[ffmpeg]>=2.37.0",
+    "ipykernel>=6.29.5",
+    "librosa>=0.11.0",
+    "modelscope>=1.25.0",
+    "protobuf>=6.30.2",
+    "safetensors>=0.5.3",
+    "sentencepiece>=0.2.0",
+    "torch>=2.0.0",
+    "torchvision>=0.22.0",
+    "transformers==4.46.2",
+]
