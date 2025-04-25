@@ -23,6 +23,7 @@ class TextVideoDataset(torch.utils.data.Dataset):
         self.height = height
         self.width = width
         self.is_i2v = is_i2v
+        self.skipped_videos = []
             
         self.frame_process = v2.Compose([
             v2.CenterCrop(size=(height, width)),
@@ -47,6 +48,8 @@ class TextVideoDataset(torch.utils.data.Dataset):
         reader = imageio.get_reader(file_path)
         if reader.count_frames() < max_num_frames or reader.count_frames() - 1 < start_frame_id + (num_frames - 1) * interval:
             reader.close()
+            # Track skipped videos due to insufficient frames
+            self.skipped_videos.append(file_path)
             return None
         
         frames = []
@@ -98,18 +101,46 @@ class TextVideoDataset(torch.utils.data.Dataset):
     def __getitem__(self, data_id):
         text = self.text[data_id]
         path = self.path[data_id]
+        
+        # Handle image files
         if self.is_image(path):
             if self.is_i2v:
                 raise ValueError(f"{path} is not a video. I2V model doesn't support image-to-image training.")
             video = self.load_image(path)
         else:
+            # Handle video files
             video = self.load_video(path)
+            
+            # Skip videos with insufficient frames
+            if video is None:
+                # Find the next valid item or fall back to a previously successful one
+                for i in range(1, len(self)):
+                    alt_id = (data_id + i) % len(self)
+                    alt_path = self.path[alt_id]
+                    if self.is_image(alt_path):
+                        if not self.is_i2v:
+                            return self.__getitem__(alt_id)
+                    else:
+                        alt_video = self.load_video(alt_path)
+                        if alt_video is not None:
+                            return self.__getitem__(alt_id)
+                
+                # If we couldn't find a valid item, raise an error
+                raise RuntimeError(f"Could not find any valid videos with sufficient frames after checking {len(self)} items")
+                
         if self.is_i2v:
             video, first_frame = video
             data = {"text": text, "video": video, "path": path, "first_frame": first_frame}
         else:
             data = {"text": text, "video": video, "path": path}
         return data
+    
+    def save_skipped_videos(self, output_path):
+        """Save the list of skipped videos to a file"""
+        with open(output_path, 'w') as f:
+            for video_path in self.skipped_videos:
+                f.write(f"{video_path}\n")
+        print(f"Saved {len(self.skipped_videos)} skipped videos to {output_path}")
     
 
     def __len__(self):
@@ -531,6 +562,10 @@ def data_process(args):
         default_root_dir=args.output_path,
     )
     trainer.test(model, dataloader)
+    
+    # Save the list of skipped videos to a file
+    skipped_videos_path = os.path.join(args.output_path, "skipped_videos.txt")
+    dataset.save_skipped_videos(skipped_videos_path)
     
     
 def train(args):
