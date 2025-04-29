@@ -199,6 +199,7 @@ class WanVideoPipeline(BasePipeline):
 
 
     def encode_prompt(self, prompt, positive=True):
+        print("Prompt: ", prompt)
         prompt_emb = self.prompter.encode_prompt(prompt, positive=positive, device=self.device)
         return {"context": prompt_emb}
     

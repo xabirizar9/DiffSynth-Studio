@@ -444,7 +444,7 @@ class LightningModelForTrain(pl.LightningModule):
             # Resize height/width if needed 
             if lip_mask.shape[2] != pred_pixels.shape[3] or lip_mask.shape[3] != pred_pixels.shape[4]:
                 lip_mask = torch.nn.functional.interpolate(
-                    lip_mask.reshape(-1, 1, lip_mask.shape[2], lip_mask.shape[3]),  # [b*frames, 1, H, W]
+                    lip_mask.reshape(-1, 1, lip_mask.shape[2], lip_mask.shape[3]).float(),  # Convert to float
                     size=(pred_pixels.shape[3], pred_pixels.shape[4]),
                     mode='bilinear',
                     align_corners=False
@@ -730,6 +730,12 @@ def parse_args():
         default=0.1,
         help="Weight for the pixel-space loss relative to diffusion loss",
     )
+    parser.add_argument(
+        "--log_every_n_steps",
+        type=int,
+        default=10,
+        help="How often to log during training (number of steps between logging)",
+    )
     args = parser.parse_args()
     return args
 
@@ -846,6 +852,7 @@ def train(args):
         accumulate_grad_batches=args.accumulate_grad_batches,
         callbacks=[pl.pytorch.callbacks.ModelCheckpoint(save_top_k=-1)],
         logger=logger,
+        log_every_n_steps=args.log_every_n_steps,
     )
     trainer.fit(model, dataloader)
 

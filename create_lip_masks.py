@@ -11,6 +11,7 @@ import signal
 import atexit
 import argparse
 
+
 # Function to get bounding box from lip mask and create box mask
 def get_lip_bbox(lip_mask):
     """
