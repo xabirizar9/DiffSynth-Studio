@@ -13,7 +13,7 @@ import numpy as np
 
 
 class TextVideoDataset(torch.utils.data.Dataset):
-    def __init__(self, base_path, metadata_path, max_num_frames=81, frame_interval=1, num_frames=81, height=480, width=832, is_i2v=False):
+    def __init__(self, base_path, metadata_path, masks_path, max_num_frames=81, frame_interval=1, num_frames=81, height=480, width=832, is_i2v=False):
         metadata = pd.read_csv(metadata_path)
         train_dir = Path(base_path) / "train"
 
@@ -784,8 +784,8 @@ def data_process(args):
     
 def train(args):
     dataset = TensorDataset(
-        args.dataset_path,
-        os.path.join(args.dataset_path, "metadata.csv"),
+        base_path=args.dataset_path,
+        metadata_path=os.path.join(args.dataset_path, "metadata.csv"),
         steps_per_epoch=args.steps_per_epoch,
         lip_masks_path=args.lip_masks_path,
         frames=50,
