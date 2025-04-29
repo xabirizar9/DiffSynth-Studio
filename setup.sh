@@ -40,6 +40,9 @@ uv sync
 echo "Downloading model from Hugging Face..."
 huggingface-cli download Wan-AI/Wan2.1-T2V-1.3B --local-dir ./models/Wan-AI/Wan2.1-T2V-1.3B
 
+git config --global user.name "Xabier Irizar"
+git config --global user.email "irizar.xabier@gmail.com"
+
 # Create virtual environment activation command
 echo "Setting up virtual environment..."
 python -m venv .venv
