@@ -1,2 +1,8 @@
 models/Wan-AI
 data/
+
+# ignore pycache
+__pycache__/
+
+# ignore symlinks
+*.lnk

@@ -1,4 +1,5 @@
 import torch, os, imageio, argparse
+from pathlib import Path
 from torchvision.transforms import v2
 from einops import rearrange
 import lightning as pl
@@ -14,9 +15,32 @@ import numpy as np
 class TextVideoDataset(torch.utils.data.Dataset):
     def __init__(self, base_path, metadata_path, max_num_frames=81, frame_interval=1, num_frames=81, height=480, width=832, is_i2v=False):
         metadata = pd.read_csv(metadata_path)
-        self.path = [os.path.join(base_path, "train", file_name) for file_name in metadata["file_name"]]
-        self.text = metadata["text"].to_list()
-        
+        train_dir = Path(base_path) / "train"
+
+        # 1) list all the already-generated .tensors.pth files once
+        self.processed = {
+            p.name  # get original filename by splitting at the dot
+            for p in train_dir.glob("*.tensors.pth")
+        }
+
+        # 2) filter metadata by file_name not in processed
+        all_fnames = metadata["file_name"].to_list()
+        all_texts  = metadata["text"].to_list()
+
+        self.path = []
+        self.text = []
+
+        for fname, txt in zip(all_fnames, all_texts):
+            stem = fname + ".tensors.pth"
+            if stem not in self.processed:
+                self.path.append(str(train_dir / fname))
+                self.text.append(txt)
+
+        print(
+            f"Found {len(self.processed)} already-processed videos, "
+            f"{len(self.path)} left to process."
+        )
+
         self.max_num_frames = max_num_frames
         self.frame_interval = frame_interval
         self.num_frames = num_frames
@@ -24,6 +48,7 @@ class TextVideoDataset(torch.utils.data.Dataset):
         self.width = width
         self.is_i2v = is_i2v
         self.skipped_videos = []
+        self.count = 0
             
         self.frame_process = v2.Compose([
             v2.CenterCrop(size=(height, width)),
@@ -101,6 +126,12 @@ class TextVideoDataset(torch.utils.data.Dataset):
     def __getitem__(self, data_id):
         text = self.text[data_id]
         path = self.path[data_id]
+
+        self.count += 1
+
+        if self.count % 100 == 0:
+            print("Count: ", self.count)
+            print("Skipped videos: ", len(self.skipped_videos))
         
         # Handle image files
         if self.is_image(path):
@@ -110,8 +141,8 @@ class TextVideoDataset(torch.utils.data.Dataset):
         else:
             # Handle video files
             video = self.load_video(path)
-            
             # Skip videos with insufficient frames
+
             if video is None:
                 # Find the next valid item or fall back to a previously successful one
                 for i in range(1, len(self)):
@@ -123,6 +154,7 @@ class TextVideoDataset(torch.utils.data.Dataset):
                     else:
                         alt_video = self.load_video(alt_path)
                         if alt_video is not None:
+                            print(alt_video.shape)
                             return self.__getitem__(alt_id)
                 
                 # If we couldn't find a valid item, raise an error
@@ -227,8 +259,9 @@ class TensorDataset(torch.utils.data.Dataset):
         data['latents'] = data['latents'][:self.frames]
         
         # Load lip mask if available
-        lip_mask = torch.load(self.lip_mask_paths[data_id], map_location="cpu")
-        data["lip_mask"] = lip_mask
+        if self.use_lip_masks:
+            lip_mask = torch.load(self.lip_mask_paths[data_id], map_location="cpu")
+            data["lip_mask"] = lip_mask
         
         return data
     
@@ -370,14 +403,7 @@ class LightningModelForTrain(pl.LightningModule):
         
         # Add pixel-space lip loss if mask is available
         if use_lip_loss:
-            # Predict clean latent
-            if hasattr(self.scheduler, "predict_start_from_noise"):
-                # For diffusion-based schedulers
-                pred_latent = self.scheduler.predict_start_from_noise(noisy_latents, timestep, noise_pred)
-            else:
-                # For FlowMatchScheduler
-                # FlowMatch directly predicts the clean latent, so we can use noise_pred directly
-                pred_latent = noise_pred
+            pred_latent = noise_pred
             
             # Decode to pixel space (with no grad to save memory)
             with torch.no_grad():
@@ -399,42 +425,34 @@ class LightningModelForTrain(pl.LightningModule):
                     pred_pixels = (pred_pixels + 1) / 2
                     target_pixels = (target_pixels + 1) / 2
             
+            # Simplify lip mask handling - our lip_mask shape is [frames, H, W]
+            # First, add batch dimension if needed
+            if lip_mask.dim() == 3:  # [frames, H, W]
+                # Add batch dimension for batch processing
+                lip_mask = lip_mask.unsqueeze(0)  # [1, frames, H, W]
             
-            # Proper reshape of lip mask to match the structure of pred_pixels [B, C, F, H, W]
-            # The lip mask is expected to be [B, H, W] or [F, H, W] or similar
+            # Make sure we have the right number of frames (truncate or pad)
+            if lip_mask.shape[1] != pred_pixels.shape[2]:
+                if lip_mask.shape[1] > pred_pixels.shape[2]:
+                    # Too many frames, truncate
+                    lip_mask = lip_mask[:, :pred_pixels.shape[2]]
+                else:
+                    # Too few frames, repeat the last frame
+                    frames_to_add = pred_pixels.shape[2] - lip_mask.shape[1]
+                    last_frame = lip_mask[:, -1:].repeat(1, frames_to_add, 1, 1)
+                    lip_mask = torch.cat([lip_mask, last_frame], dim=1)
             
-            # First, make sure lip mask has the right number of frames
-            if lip_mask.shape[0] != pred_pixels.shape[2]:
-                # If lip_mask is [F, H, W], we need to truncate/extend frames
-                if lip_mask.dim() == 3:  # [F, H, W]
-                    if lip_mask.shape[0] > pred_pixels.shape[2]:
-                        # Truncate frames
-                        lip_mask = lip_mask[:pred_pixels.shape[2]]
-                    elif lip_mask.shape[0] < pred_pixels.shape[2]:
-                        # Extend frames by repeating the last frame
-                        frames_to_add = pred_pixels.shape[2] - lip_mask.shape[0]
-                        last_frame = lip_mask[-1:].repeat(frames_to_add, 1, 1)
-                        lip_mask = torch.cat([lip_mask, last_frame], dim=0)
-            
-            # Now reshape to match predicted pixels format: [1, 1, F, H, W]
-            # This assumes lip_mask is [F, H, W] after the above adjustments
-            if lip_mask.dim() == 3:  # [F, H, W]
-                lip_mask = lip_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, F, H, W]
-            elif lip_mask.dim() == 4 and lip_mask.shape[0] == 1:  # [1, F, H, W]
-                lip_mask = lip_mask.unsqueeze(1)  # [1, 1, F, H, W]
-            
-            # Make sure the height and width dimensions match
-            if lip_mask.shape[3] != pred_pixels.shape[3] or lip_mask.shape[4] != pred_pixels.shape[4]:
-                # Resize lip mask using interpolate
+            # Resize height/width if needed 
+            if lip_mask.shape[2] != pred_pixels.shape[3] or lip_mask.shape[3] != pred_pixels.shape[4]:
                 lip_mask = torch.nn.functional.interpolate(
-                    lip_mask.reshape(-1, 1, lip_mask.shape[3], lip_mask.shape[4]),
+                    lip_mask.reshape(-1, 1, lip_mask.shape[2], lip_mask.shape[3]),  # [b*frames, 1, H, W]
                     size=(pred_pixels.shape[3], pred_pixels.shape[4]),
                     mode='bilinear',
                     align_corners=False
-                ).reshape(lip_mask.shape[0], lip_mask.shape[1], lip_mask.shape[2], pred_pixels.shape[3], pred_pixels.shape[4])
+                ).reshape(lip_mask.shape[0], lip_mask.shape[1], pred_pixels.shape[3], pred_pixels.shape[4])
             
-            # Create weighted mask (1 + alpha * lip_mask)
-            # Make sure dimensions are properly aligned
+            # Add channel dimension to match pred_pixels [B, C, F, H, W]
+            lip_mask = lip_mask.unsqueeze(1)  # [B, 1, F, H, W]
             
             # Create weighted mask (1 + alpha * lip_mask)
             lip_weight = 1.0 + self.lip_alpha * lip_mask
@@ -445,14 +463,14 @@ class LightningModelForTrain(pl.LightningModule):
             ).mean(dim=1, keepdim=True)  # Now [B, 1, F, H, W]
             
             # Weighted pixel loss
-            pixel_loss = (lip_weight * pixel_error).sum() / lip_weight.sum()
+            lip_loss = (lip_weight * pixel_error).sum() / lip_weight.sum()
             
             # Combine losses
-            loss = diff_loss + self.pixel_weight * pixel_loss
+            loss = diff_loss + self.pixel_weight * lip_loss
             
             # Log both losses
             self.log("diff_loss", diff_loss.item(), prog_bar=True)
-            self.log("pixel_loss", pixel_loss.item(), prog_bar=True)
+            self.log("lip_loss", lip_loss.item(), prog_bar=True)
         else:
             loss = diff_loss
 
@@ -674,6 +692,22 @@ def parse_args():
         help="SwanLab mode (cloud or local).",
     )
     parser.add_argument(
+        "--use_wandb",
+        default=False,
+        action="store_true",
+        help="Whether to use Weights & Biases logger.",
+    )
+    parser.add_argument(
+        "--wandb_project",
+        default="diffsynth-studio",
+        help="Weights & Biases project name.",
+    )
+    parser.add_argument(
+        "--wandb_name",
+        default="wan",
+        help="Weights & Biases run name.",
+    )
+    parser.add_argument(
         "--lip_masks_path",
         type=str,
         default=None,
@@ -737,6 +771,11 @@ def data_process(args):
     skipped_videos_path = os.path.join(args.output_path, "skipped_videos.txt")
     dataset.save_skipped_videos(skipped_videos_path)
     
+    # Report final processing summary
+    print("\n===== Processing Summary =====")
+    print(f"Videos processed in this run: {len(dataset.path)}")
+    print("===============================")
+    
     
 def train(args):
     dataset = TensorDataset(
@@ -768,6 +807,8 @@ def train(args):
         lip_alpha=args.lip_alpha,
         pixel_weight=args.pixel_weight,
     )
+    loggers = []
+    
     if args.use_swanlab:
         from swanlab.integration.pytorch_lightning import SwanLabLogger
         swanlab_config = {"UPPERFRAMEWORK": "DiffSynth-Studio"}
@@ -779,9 +820,23 @@ def train(args):
             mode=args.swanlab_mode,
             logdir=os.path.join(args.output_path, "swanlog"),
         )
-        logger = [swanlab_logger]
-    else:
-        logger = None
+        loggers.append(swanlab_logger)
+    
+    if args.use_wandb:
+        from lightning.pytorch.loggers import WandbLogger
+        wandb_config = {"UPPERFRAMEWORK": "DiffSynth-Studio"}
+        wandb_config.update(vars(args))
+        wandb_logger = WandbLogger(
+            project=args.wandb_project,
+            name=args.wandb_name,
+            log_model=True,
+            save_dir=os.path.join(args.output_path, "wandb"),
+            config=wandb_config
+        )
+        loggers.append(wandb_logger)
+    
+    logger = loggers if loggers else None
+        
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         accelerator="gpu",

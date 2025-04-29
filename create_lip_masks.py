@@ -69,16 +69,15 @@ def train(args):
     # Create dataset
     face_ds = VideoDataset(
         root_dir=args.root_dir,
+        max_files=args.max_files,
         max_frames=args.max_frames,
-        height=args.height,
-        width=args.width,
-        max_files=args.max_files
+        output_dir=args.output_dir
     )
     
-    # Create dataloader
+    # Create dataloader - always batch size 1 to preserve original dimensions
     dataloader = DataLoader(
         face_ds,
-        batch_size=args.batch_size,
+        batch_size=1,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
@@ -87,7 +86,7 @@ def train(args):
     
     # Load model
     model = BiSeNet(n_classes=19)
-    model.load_state_dict(torch.load("79999_iter.pth"))
+    model.load_state_dict(torch.load("dataset/79999_iter.pth"))
     model = accelerator.prepare(model)
     print("device: ", accelerator.device)
     model.eval()
@@ -101,7 +100,7 @@ def train(args):
     try:
         # Process videos
         with torch.no_grad():
-            for batch_data in dataloader:
+            for batch_idx, batch_data in enumerate(dataloader):
                 videos, filenames = batch_data
                 
                 # videos shape: (batch_size, n_frames, 3, H, W)
@@ -109,9 +108,6 @@ def train(args):
 
                 # Process output to get lip masks
                 parsing = torch.argmax(out, dim=2)
-                print("out: ", out.shape)
-                print("parsing: ", parsing.shape)
-                print(torch.unique(parsing))
 
                 # Create a binary mask for lips (class 12 is upper lip, 13 is lower lip)
                 lip_mask = torch.zeros_like(parsing, dtype=torch.float)
@@ -121,9 +117,11 @@ def train(args):
                 lip_mask_tensor = lip_mask.to(torch.uint8)
 
                 
+                # Save lip mask for this video
+                mask_filename = os.path.splitext(filenames[0])[0] + "_mask.pt"
+                torch.save(lip_mask_tensor, os.path.join(args.output_dir, mask_filename))
+                print(f"Saved mask for {mask_filename} with shape {lip_mask_tensor.shape}")
                 
-                # Save lip masks for each video in one operation
-                save_batch_masks(lip_mask_tensor, filenames, args.output_dir)
     except Exception as e:
         print(f"Error during processing: {e}")
         raise
@@ -139,22 +137,6 @@ def collate_videos(batch):
     videos = torch.stack(videos)
     return videos, filenames
 
-def save_batch_masks(masks, filenames, output_dir):
-    """
-    Save batch of masks efficiently
-    
-    Args:
-        masks: Tensor of shape (batch_size, n_frames, H, W)
-        filenames: List of video filenames
-        output_dir: Directory to save masks
-    """
-    for mask, filename in zip(masks, filenames):
-        # Create mask filename
-        mask_filename = os.path.splitext(filename)[0] + "_mask.pt"
-        # Save mask
-        torch.save(mask, os.path.join(output_dir, mask_filename))
-        print(f"Saved mask for {filename}")
-
 def parse_args():
     parser = argparse.ArgumentParser(description='Create lip masks from videos')
     parser.add_argument('--root_dir', type=str, default='dataset/train', 
@@ -163,14 +145,8 @@ def parse_args():
                         help='Directory to save lip masks')
     parser.add_argument('--max_files', type=int, default=None, 
                         help='Maximum number of videos to process')
-    parser.add_argument('--max_frames', type=int, default=50, 
-                        help='Maximum number of frames to process per video')
-    parser.add_argument('--height', type=int, default=512, 
-                        help='Height for video frames')
-    parser.add_argument('--width', type=int, default=512, 
-                        help='Width for video frames')
-    parser.add_argument('--batch_size', type=int, default=4, 
-                        help='Batch size for processing')
+    parser.add_argument('--max_frames', type=int, default=None, 
+                        help='Maximum number of frames to process')
     parser.add_argument('--num_workers', type=int, default=4, 
                         help='Number of dataloader workers')
     return parser.parse_args()
@@ -182,8 +158,5 @@ if __name__ == "__main__":
     print(f"  output_dir: {args.output_dir}")
     print(f"  max_files: {args.max_files}")
     print(f"  max_frames: {args.max_frames}")
-    print(f"  height: {args.height}")
-    print(f"  width: {args.width}")
-    print(f"  batch_size: {args.batch_size}")
     print(f"  num_workers: {args.num_workers}")
     train(args)
