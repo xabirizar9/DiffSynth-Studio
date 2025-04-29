@@ -154,7 +154,6 @@ class TextVideoDataset(torch.utils.data.Dataset):
                     else:
                         alt_video = self.load_video(alt_path)
                         if alt_video is not None:
-                            print(alt_video.shape)
                             return self.__getitem__(alt_id)
                 
                 # If we couldn't find a valid item, raise an error
