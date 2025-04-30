@@ -11,40 +11,39 @@ import signal
 import atexit
 import argparse
 
+# Process the output to get the parsing map using torch operations
+def get_face_mask(out):
+    parsing = torch.argmax(out, dim=2)
 
-# Function to get bounding box from lip mask and create box mask
-def get_lip_bbox(lip_mask):
-    """
-    Extract bounding box coordinates from a lip mask and create a box mask
+    # Create a binary mask for lips (class 12 is upper lip, 13 is lower lip)
+    lip_mask = torch.zeros_like(parsing, dtype=torch.float)
+    # Facial feature classes in BiSeNet:
+    # 1=skin, 2=l_brow, 3=r_brow, 4=l_eye, 5=r_eye, 6=eye_g, 7=l_ear, 8=r_ear, 9=ear_r,
+    # 10=nose, 11=mouth, 12=u_lip, 13=l_lip, 14=neck, 15=neck_l, 16=cloth, 17=hair, 18=hat
     
-    Args:
-        lip_mask: Binary mask tensor with shape (H, W)
-        
-    Returns:
-        tuple: (x_min, y_min, x_max, y_max, box_mask) or None if no lip pixels found
-              where box_mask is a tensor with ones in the bounding box area
-    """
-    # Convert to numpy for processing
-    mask_np = lip_mask.cpu().numpy()
+    # Skin
+    lip_mask[parsing == 1] = 1
+    # Eyebrows
+    lip_mask[(parsing == 2) | (parsing == 3)] = 1
+    # Eyes
+    lip_mask[(parsing == 4) | (parsing == 5)] = 1
+    # Eye glasses
+    lip_mask[parsing == 6] = 1
+    # Ears
+    lip_mask[(parsing == 7) | (parsing == 8)] = 1
+    # Ear rings
+    lip_mask[parsing == 9] = 1
+    # Nose
+    lip_mask[parsing == 10] = 1
+    # Mouth
+    lip_mask[parsing == 11] = 1
+    # Lips
+    lip_mask[(parsing == 12) | (parsing == 13)] = 1
     
-    # Find non-zero coordinates (lip pixels)
-    y_indices, x_indices = np.where(mask_np > 0)
-    
-    # Check if any lip pixels were found
-    if len(y_indices) == 0 or len(x_indices) == 0:
-        return None
-    
-    # Get min and max coordinates to form bounding box
-    x_min = int(np.min(x_indices))
-    y_min = int(np.min(y_indices))
-    x_max = int(np.max(x_indices))
-    y_max = int(np.max(y_indices))
-    
-    # Create a new mask with ones in the bounding box area
-    box_mask = torch.zeros_like(lip_mask)
-    box_mask[y_min:y_max+1, x_min:x_max+1] = 1.0
-    
-    return box_mask
+    lip_mask_tensor = lip_mask.to(torch.uint8)
+
+    return lip_mask_tensor
+
 
 def cleanup():
     """Properly clean up distributed resources"""
@@ -107,21 +106,12 @@ def train(args):
                 # videos shape: (batch_size, n_frames, 3, H, W)
                 out = model(videos.to(accelerator.device))[0]
 
-                # Process output to get lip masks
-                parsing = torch.argmax(out, dim=2)
-
-                # Create a binary mask for lips (class 12 is upper lip, 13 is lower lip)
-                lip_mask = torch.zeros_like(parsing, dtype=torch.float)
-                lip_mask[(parsing == 12) | (parsing == 13)] = 1
-                
-                # Convert to more efficient binary format
-                lip_mask_tensor = lip_mask.to(torch.uint8)
-
+                mask_tensor = get_face_mask(out)
                 
                 # Save lip mask for this video
                 mask_filename = os.path.splitext(filenames[0])[0] + "_mask.pt"
-                torch.save(lip_mask_tensor, os.path.join(args.output_dir, mask_filename))
-                print(f"Saved mask for {mask_filename} with shape {lip_mask_tensor.shape}")
+                torch.save(mask_tensor, os.path.join(args.output_dir, mask_filename))
+                # print(f"Saved mask for {mask_filename} with shape {mask_tensor.shape}")
                 
     except Exception as e:
         print(f"Error during processing: {e}")
@@ -161,3 +151,8 @@ if __name__ == "__main__":
     print(f"  max_frames: {args.max_frames}")
     print(f"  num_workers: {args.num_workers}")
     train(args)
+
+    # accelerate launch create_lip_masks.py \
+    # --num_workers 4 \
+    # --max_frames 100 \
+    # --output_dir dataset/lip_masks
