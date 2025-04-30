@@ -713,11 +713,18 @@ def parse_args():
         default=10,
         help="How often to log during training (number of steps between logging)",
     )
+    parser.add_argument(
+        "--save_every_n_steps",
+        type=int,
+        default=50,
+        help="Save a checkpoint every N training steps",
+    )
     args = parser.parse_args()
     return args
 
 
 def data_process(args):
+
     dataset = TextVideoDataset(
         args.dataset_path,
         os.path.join(args.dataset_path, "metadata.csv"),
@@ -762,7 +769,7 @@ def data_process(args):
 def train(args):
     dataset = TensorDataset(
         base_path=args.dataset_path,
-        metadata_path=os.path.join(args.dataset_path, "metadata.csv"),
+        metadata_path=os.path.join(args.dataset_path, "filtered_metadata.csv"),
         steps_per_epoch=args.steps_per_epoch,
         lip_masks_path=args.lip_masks_path,
         frames=60,
@@ -798,7 +805,7 @@ def train(args):
         wandb_logger = WandbLogger(
             project=args.wandb_project,
             name=args.wandb_name,
-            log_model=True,
+            log_model=False,
             save_dir=os.path.join(args.output_path, "wandb"),
             config=wandb_config
         )
@@ -814,7 +821,11 @@ def train(args):
         strategy=args.training_strategy,
         default_root_dir=args.output_path,
         accumulate_grad_batches=args.accumulate_grad_batches,
-        callbacks=[pl.pytorch.callbacks.ModelCheckpoint(save_top_k=-1)],
+        callbacks=[pl.pytorch.callbacks.ModelCheckpoint(
+            save_top_k=-1,  # Keep all checkpoints
+            every_n_train_steps=args.save_every_n_steps,  # Save every N steps
+            filename='model-{step}'  # Include step number in filename
+        )],
         logger=logger,
         log_every_n_steps=args.log_every_n_steps,
     )

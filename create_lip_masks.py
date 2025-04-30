@@ -10,7 +10,40 @@ import os
 import signal
 import atexit
 import argparse
+# Process the output to get the parsing map using torch operations
 
+def get_lip_mask(out):
+    parsing = torch.argmax(out, dim=2)
+    print(torch.unique(parsing))
+
+    # Create a binary mask for lips (class 12 is upper lip, 13 is lower lip)
+    lip_mask = torch.zeros_like(parsing, dtype=torch.float)
+    # Facial feature classes in BiSeNet:
+    # 1=skin, 2=l_brow, 3=r_brow, 4=l_eye, 5=r_eye, 6=eye_g, 7=l_ear, 8=r_ear, 9=ear_r,
+    # 10=nose, 11=mouth, 12=u_lip, 13=l_lip, 14=neck, 15=neck_l, 16=cloth, 17=hair, 18=hat
+    
+    # Skin
+    lip_mask[parsing == 1] = 1
+    # Eyebrows
+    lip_mask[(parsing == 2) | (parsing == 3)] = 1
+    # Eyes
+    lip_mask[(parsing == 4) | (parsing == 5)] = 1
+    # Eye glasses
+    lip_mask[parsing == 6] = 1
+    # Ears
+    lip_mask[(parsing == 7) | (parsing == 8)] = 1
+    # Ear rings
+    lip_mask[parsing == 9] = 1
+    # Nose
+    lip_mask[parsing == 10] = 1
+    # Mouth
+    lip_mask[parsing == 11] = 1
+    # Lips
+    lip_mask[(parsing == 12) | (parsing == 13)] = 1
+    
+    lip_mask_tensor = lip_mask.to(torch.uint8)
+
+    return lip_mask_tensor
 
 # Function to get bounding box from lip mask and create box mask
 def get_lip_bbox(lip_mask):
@@ -161,3 +194,8 @@ if __name__ == "__main__":
     print(f"  max_frames: {args.max_frames}")
     print(f"  num_workers: {args.num_workers}")
     train(args)
+
+    # accelerate launch create_lip_masks.py \       
+    # --num_workers 4 \
+    # --max_frames 100 \
+    # --output_dir dataset/face_masks
