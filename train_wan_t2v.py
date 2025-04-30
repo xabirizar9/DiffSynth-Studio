@@ -260,7 +260,7 @@ class TensorDataset(torch.utils.data.Dataset):
         # Load lip mask if available
         if self.use_lip_masks:
             lip_mask = torch.load(self.lip_mask_paths[data_id], map_location="cpu")
-            data["lip_mask"] = lip_mask
+            data["lip_mask"] = lip_mask.float()[:self.frames]
         
         return data
     
@@ -406,51 +406,27 @@ class LightningModelForTrain(pl.LightningModule):
             
             # Decode to pixel space (with no grad to save memory)
             with torch.no_grad():
-                # Use the correct decoding method from the pipeline
                 pred_pixels = self.pipe.vae.decode(pred_latent, device=self.device)
                 target_pixels = self.pipe.vae.decode(latents, device=self.device)
+                # Pred pixels is [B, C, F, H, W]
                 
-                # Get the number of frames in original latents (before VAE decoding)
-                original_num_frames = latents.shape[2]
-                
-                # Check if VAE output has more frames than input and truncate if needed
-                if pred_pixels.shape[2] > original_num_frames:
-                    pred_pixels = pred_pixels[:, :, :original_num_frames]
-                if target_pixels.shape[2] > original_num_frames:
-                    target_pixels = target_pixels[:, :, :original_num_frames]
-                
-                # Convert from [-1,1] to [0,1] range if needed
-                if pred_pixels.min() < 0:
-                    pred_pixels = (pred_pixels + 1) / 2
-                    target_pixels = (target_pixels + 1) / 2
-            
-            # Simplify lip mask handling - our lip_mask shape is [frames, H, W]
-            # First, add batch dimension if needed
-            if lip_mask.dim() == 3:  # [frames, H, W]
-                # Add batch dimension for batch processing
-                lip_mask = lip_mask.unsqueeze(0)  # [1, frames, H, W]
+            num_frames = pred_pixels.shape[2] # [B, C, frames, H, W]
+            mask_num_frames = lip_mask.shape[1] # [B, frames, H, W]
             
             # Make sure we have the right number of frames (truncate or pad)
-            if lip_mask.shape[1] != pred_pixels.shape[2]:
-                if lip_mask.shape[1] > pred_pixels.shape[2]:
-                    # Too many frames, truncate
-                    lip_mask = lip_mask[:, :pred_pixels.shape[2]]
-                else:
-                    # Too few frames, repeat the last frame
-                    frames_to_add = pred_pixels.shape[2] - lip_mask.shape[1]
-                    last_frame = lip_mask[:, -1:].repeat(1, frames_to_add, 1, 1)
-                    lip_mask = torch.cat([lip_mask, last_frame], dim=1)
+            if mask_num_frames > num_frames:
+                # Too many frames, truncate
+                lip_mask = lip_mask[:, :num_frames]
             
-            # Resize height/width if needed 
-            if lip_mask.shape[2] != pred_pixels.shape[3] or lip_mask.shape[3] != pred_pixels.shape[4]:
-                lip_mask = torch.nn.functional.interpolate(
-                    lip_mask.reshape(-1, 1, lip_mask.shape[2], lip_mask.shape[3]).float(),  # Convert to float
-                    size=(pred_pixels.shape[3], pred_pixels.shape[4]),
-                    mode='bilinear',
-                    align_corners=False
-                ).reshape(lip_mask.shape[0], lip_mask.shape[1], pred_pixels.shape[3], pred_pixels.shape[4])
+            # Resize height/width to match pred_pixels
+            lip_mask = torchvision.transforms.functional.resize(
+                lip_mask,
+                (pred_pixels.shape[3], pred_pixels.shape[4]),
+                interpolation=torchvision.transforms.InterpolationMode.BILINEAR,
+                antialias=True
+            )
             
-            # Add channel dimension to match pred_pixels [B, C, F, H, W]
+            # Add channel dimension to match    [B, C, F, H, W]
             lip_mask = lip_mask.unsqueeze(1)  # [B, 1, F, H, W]
             
             # Create weighted mask (1 + alpha * lip_mask)
@@ -793,7 +769,7 @@ def train(args):
     dataloader = torch.utils.data.DataLoader(
         dataset,
         shuffle=True,
-        batch_size=1,
+        batch_size=2,
         num_workers=args.dataloader_num_workers
     )
     model = LightningModelForTrain(
@@ -813,20 +789,7 @@ def train(args):
         pixel_weight=args.pixel_weight,
     )
     loggers = []
-    
-    if args.use_swanlab:
-        from swanlab.integration.pytorch_lightning import SwanLabLogger
-        swanlab_config = {"UPPERFRAMEWORK": "DiffSynth-Studio"}
-        swanlab_config.update(vars(args))
-        swanlab_logger = SwanLabLogger(
-            project="wan", 
-            name="wan",
-            config=swanlab_config,
-            mode=args.swanlab_mode,
-            logdir=os.path.join(args.output_path, "swanlog"),
-        )
-        loggers.append(swanlab_logger)
-    
+
     if args.use_wandb:
         from lightning.pytorch.loggers import WandbLogger
         wandb_config = {"UPPERFRAMEWORK": "DiffSynth-Studio"}
