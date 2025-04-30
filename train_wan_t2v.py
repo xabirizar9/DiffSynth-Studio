@@ -102,7 +102,8 @@ class TextVideoDataset(torch.utils.data.Dataset):
 
 
     def load_video(self, file_path):
-        start_frame_id = torch.randint(0, self.max_num_frames - (self.num_frames - 1) * self.frame_interval, (1,))[0]
+        # Always start from the beginning of the video
+        start_frame_id = 0
         frames = self.load_frames_using_imageio(file_path, self.max_num_frames, start_frame_id, self.frame_interval, self.num_frames, self.frame_process)
         return frames
     
@@ -260,7 +261,7 @@ class TensorDataset(torch.utils.data.Dataset):
         # Load lip mask if available
         if self.use_lip_masks:
             lip_mask = torch.load(self.lip_mask_paths[data_id], map_location="cpu")
-            data["lip_mask"] = lip_mask.float()[:self.frames]
+            data["lip_mask"] = lip_mask.float()[:, :self.frames]
         
         return data
     
@@ -764,7 +765,7 @@ def train(args):
         metadata_path=os.path.join(args.dataset_path, "metadata.csv"),
         steps_per_epoch=args.steps_per_epoch,
         lip_masks_path=args.lip_masks_path,
-        frames=50,
+        frames=60,
     )
     dataloader = torch.utils.data.DataLoader(
         dataset,
