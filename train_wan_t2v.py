@@ -13,7 +13,7 @@ import numpy as np
 
 
 class TextVideoDataset(torch.utils.data.Dataset):
-    def __init__(self, base_path, metadata_path, masks_path, max_num_frames=81, frame_interval=1, num_frames=81, height=480, width=832, is_i2v=False):
+    def __init__(self, base_path, metadata_path, max_num_frames=81, frame_interval=1, num_frames=81, height=480, width=832, is_i2v=False):
         metadata = pd.read_csv(metadata_path)
         train_dir = Path(base_path) / "train"
 
