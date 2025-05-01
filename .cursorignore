@@ -1,4 +1,3 @@
 data/
 .venv/
-.cache/ 
-models/
+.cache/

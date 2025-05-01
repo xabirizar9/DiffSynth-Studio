@@ -1,15 +1,23 @@
-import torch, os, imageio, argparse
-from pathlib import Path
-from torchvision.transforms import v2
-from einops import rearrange
+import numpy as np
 import lightning as pl
 import pandas as pd
+import torch
+import os
+import imageio
+import argparse
+import torchvision
+import torchaudio
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import Wav2Vec2Model, Wav2Vec2Processor
+
+from pathlib import Path
+from einops import rearrange
 from diffsynth import WanVideoPipeline, ModelManager, load_state_dict
 from peft import LoraConfig, inject_adapter_in_model
-import torchvision
 from PIL import Image
-import numpy as np
 
+from torchvision.transforms import v2
 
 
 class TextVideoDataset(torch.utils.data.Dataset):
@@ -215,16 +223,26 @@ class LightningModelForDataProcess(pl.LightningModule):
 
 
 class TensorDataset(torch.utils.data.Dataset):
-    def __init__(self, base_path, metadata_path, steps_per_epoch, lip_masks_path=None, frames: int = 81):
+    def __init__(self, base_path, metadata_path, steps_per_epoch: int, lip_masks_path=None, audio_path=None, frames: int = 81, audio_sample_rate: int = 16000):
         metadata = pd.read_csv(metadata_path)
         self.path = [os.path.join(base_path, "train", file_name) for file_name in metadata["file_name"]]
         self.frames = frames
+        self.video_fps = 25 # Average fps of the dataset.
+        self.audio_sample_rate = audio_sample_rate
+
         print(len(self.path), "videos in metadata.")
         
         # Filter for tensors that exist
         self.tensor_paths = [i + ".tensors.pth" for i in self.path if os.path.exists(i + ".tensors.pth")]
         print(len(self.tensor_paths), "tensors cached in metadata.")
         assert len(self.tensor_paths) > 0
+
+        # Load audio paths
+        self.audio_paths = [os.path.join(base_path, "audio", file_name.replace(".mp4", ".wav")) for file_name in metadata["file_name"]]
+        print(len(self.audio_paths), "audio files in metadata.")
+        
+        # Initialize wav2vec processor and model
+        self.wav2vec_processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
         
         # Handle lip masks
         self.lip_masks_path = lip_masks_path
@@ -233,7 +251,7 @@ class TensorDataset(torch.utils.data.Dataset):
             self.lip_mask_paths = []
             valid_tensor_paths = []
             
-            for tensor_path in self.tensor_paths:
+            for i, tensor_path in enumerate(self.tensor_paths):
                 base_path = tensor_path.replace(".tensors.pth", "")
                 filename = os.path.basename(base_path)
                 mask_filename = os.path.splitext(filename)[0] + "_mask.pt"
@@ -248,6 +266,7 @@ class TensorDataset(torch.utils.data.Dataset):
             print(f"{len(self.lip_mask_paths)} lip masks found and matched with tensors.")
             print(f"{len(self.tensor_paths)} tensors remaining after filtering for lip masks.")
             assert len(self.tensor_paths) > 0, "No tensors with matching lip masks found"
+        
         self.steps_per_epoch = steps_per_epoch
 
 
@@ -255,8 +274,30 @@ class TensorDataset(torch.utils.data.Dataset):
         data_id = torch.randint(0, len(self.tensor_paths), (1,))[0]
         data_id = (data_id + index) % len(self.tensor_paths) # For fixed seed.
         path = self.tensor_paths[data_id]
+        audio_path = self.audio_paths[data_id]
+
+        # Load latents
         data = torch.load(path, weights_only=True, map_location="cpu")
         data['latents'] = data['latents'][:self.frames]
+
+        # Load and process audio with wav2vec
+        audio = self.load_audio(audio_path)
+        
+        # Process with wav2vec
+        with torch.no_grad():
+            # Convert to mono if stereo
+            if audio.shape[0] > 1:
+                audio = torch.mean(audio, dim=0, keepdim=True)
+            
+            # Prepare for wav2vec processing
+            input_values = self.wav2vec_processor(
+                audio.squeeze().numpy(), 
+                sampling_rate=self.audio_sample_rate,
+                return_tensors="pt"
+            ).input_values
+            
+        # Store the processed audio
+        data["audio_latents"] = input_values
         
         # Load lip mask if available
         if self.use_lip_masks:
@@ -269,6 +310,67 @@ class TensorDataset(torch.utils.data.Dataset):
     def __len__(self):
         return self.steps_per_epoch
 
+    def load_audio(self, audio_path):
+        audio, sr = torchaudio.load(audio_path)
+        
+        # Resample if needed
+        if sr != self.audio_sample_rate:
+            resampler = torchaudio.transforms.Resample(sr, self.audio_sample_rate)
+            audio = resampler(audio)
+
+        scaling_factor = self.audio_sample_rate / sr
+
+        # Get audio segment matching video frames
+        end_s = self.frames / self.video_fps
+        target_samples = int(end_s * scaling_factor * self.audio_sample_rate)
+
+        return audio[:, :target_samples]
+
+
+class Wav2Vec2AudioProjection(nn.Module):
+    def __init__(self, wav2vec_model_name="facebook/wav2vec2-base-960h", embed_dim=4096, freeze_feature_encoder=True):
+        super().__init__()
+        # Load pre-trained wav2vec model
+        self.wav2vec_model = Wav2Vec2Model.from_pretrained(wav2vec_model_name)
+        
+        # Freeze feature encoder (CNN part) but keep transformer trainable for fine-tuning
+        if freeze_feature_encoder:
+            for param in self.wav2vec_model.feature_extractor.parameters():
+                param.requires_grad = False
+        
+        # Get wav2vec hidden dimension
+        wav2vec_dim = self.wav2vec_model.config.hidden_size
+        
+        # Simple MLP for audio projection - project to match text embedding dimension
+        self.mlp = nn.Sequential(
+            nn.Linear(wav2vec_dim, wav2vec_dim * 2),
+            nn.GELU(),
+            nn.Linear(wav2vec_dim * 2, embed_dim)
+        )
+        
+    def forward(self, input_values):
+        # Extract features from wav2vec
+        feature_requires_grad = False
+        for param in self.wav2vec_model.feature_extractor.parameters():
+            if param.requires_grad:
+                feature_requires_grad = True
+                break
+        
+        # If feature extractor is frozen, don't track gradients through it
+        with torch.set_grad_enabled(feature_requires_grad):
+            wav2vec_outputs = self.wav2vec_model(
+                input_values.squeeze(1),
+                return_dict=True
+            )
+        
+        # Get the hidden states from the last layer
+        last_hidden_state = wav2vec_outputs.last_hidden_state  # [batch, seq_len, hidden_size]
+        
+        # Apply MLP projection
+        audio_embeddings = self.mlp(last_hidden_state)
+        
+        # Return proper shape: [batch_size, seq_len, embed_dim]
+        return audio_embeddings
 
 
 class LightningModelForTrain(pl.LightningModule):
@@ -282,7 +384,10 @@ class LightningModelForTrain(pl.LightningModule):
         pretrained_lora_path=None,
         use_lip_weighted_loss=False,
         lip_alpha=5.0,
-        pixel_weight=0.1
+        pixel_weight=0.1,
+        audio_embed_dim=4096,  # Match the text embedding dimension
+        audio_alpha=0.5,
+        freeze_feature_encoder=True
     ):
         super().__init__()
         model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
@@ -296,7 +401,17 @@ class LightningModelForTrain(pl.LightningModule):
         
         self.scheduler = self.pipe.scheduler
         self.scheduler.set_timesteps(1000, training=True)
+        
+        # Add audio projection module
+        self.audio_projection = Wav2Vec2AudioProjection(
+            wav2vec_model_name="facebook/wav2vec2-base-960h",
+            embed_dim=audio_embed_dim,
+            freeze_feature_encoder=freeze_feature_encoder
+        )
+        self.audio_alpha = audio_alpha
+        
         self.freeze_parameters()
+        
         if train_architecture == "lora":
             self.add_lora_to_model(
                 self.pipe.denoising_model(),
@@ -306,8 +421,18 @@ class LightningModelForTrain(pl.LightningModule):
                 init_lora_weights=init_lora_weights,
                 pretrained_lora_path=pretrained_lora_path,
             )
+            
+            # Also add LoRA to audio projection
+            self.add_lora_to_model(
+                self.audio_projection,
+                lora_rank=lora_rank//2,  # Smaller rank for audio
+                lora_alpha=lora_alpha,
+                lora_target_modules="projection.1,projection.3",  # Target the linear layers
+                init_lora_weights=init_lora_weights
+            )
         else:
             self.pipe.denoising_model().requires_grad_(True)
+            self.audio_projection.requires_grad_(True)
         
         self.learning_rate = learning_rate
         self.use_gradient_checkpointing = use_gradient_checkpointing
@@ -362,6 +487,17 @@ class LightningModelForTrain(pl.LightningModule):
             num_unexpected_keys = len(unexpected_keys)
             print(f"{num_updated_keys} parameters are loaded from {pretrained_lora_path}. {num_unexpected_keys} parameters are unexpected.")
     
+    def process_audio_features(self, batch):
+        # Extract audio features from batch
+        audio_latents = batch["audio_latents"]
+        
+        # Move to device and convert to float32 for processing
+        audio_latents = audio_latents.to(self.device, dtype=torch.float32)
+        
+        # Process through wav2vec audio projection model
+        audio_embeddings = self.audio_projection(audio_latents)
+        
+        return audio_embeddings
 
     def training_step(self, batch, batch_idx):
         # Data
@@ -373,6 +509,9 @@ class LightningModelForTrain(pl.LightningModule):
             image_emb["clip_feature"] = image_emb["clip_feature"][0].to(self.device)
         if "y" in image_emb:
             image_emb["y"] = image_emb["y"][0].to(self.device)
+        
+        # Process audio features
+        audio_embeddings = self.process_audio_features(batch)
         
         # Get lip mask if available
         lip_mask = batch.get("lip_mask", [None])[0]
@@ -390,9 +529,29 @@ class LightningModelForTrain(pl.LightningModule):
         noisy_latents = self.scheduler.add_noise(latents, noise, timestep)
         training_target = self.scheduler.training_target(latents, noise, timestep)
 
-        # Compute noise prediction
+        # Prepare model inputs
+        model_inputs = {
+            "timestep": timestep,
+            **extra_input,
+            **image_emb
+        }
+        
+        # Get text context embeddings
+        text_context = prompt_emb["context"]  # [batch, seq_len, hidden_dim]
+        
+        # Apply weighting to audio embeddings to control their influence
+        audio_embeddings = audio_embeddings * self.audio_alpha
+        
+        # Concatenate text and audio embeddings along sequence length dimension
+        combined_context = torch.cat([text_context, audio_embeddings], dim=1)
+        
+        # Use combined context for cross-attention
+        model_inputs["context"] = combined_context
+        
+        # Compute noise prediction with combined context
         noise_pred = self.pipe.denoising_model()(
-            noisy_latents, timestep=timestep, **prompt_emb, **extra_input, **image_emb,
+            noisy_latents,
+            **model_inputs,
             use_gradient_checkpointing=self.use_gradient_checkpointing,
             use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload
         )
@@ -450,26 +609,66 @@ class LightningModelForTrain(pl.LightningModule):
         else:
             loss = diff_loss
 
+        # Add a dummy regularization term to ensure all parameters are used
+        dummy_reg = 0.0
+        # Include denoising model parameters
+        for param in self.pipe.denoising_model().parameters():
+            if param.requires_grad:
+                dummy_reg = dummy_reg + 0.0 * param.sum()
+        
+        # Include audio projection parameters
+        for param in self.audio_projection.parameters():
+            if param.requires_grad:
+                dummy_reg = dummy_reg + 0.0 * param.sum()
+                
+        # Add the dummy regularization to the loss (has no effect on optimization)
+        loss = loss + dummy_reg
+
         # Record log
         self.log("train_loss", loss, prog_bar=True)
         return loss
 
 
     def configure_optimizers(self):
-        trainable_modules = filter(lambda p: p.requires_grad, self.pipe.denoising_model().parameters())
+        # Train both denoising model and audio projection
+        trainable_modules = list(filter(lambda p: p.requires_grad, self.pipe.denoising_model().parameters()))
+        trainable_modules += list(filter(lambda p: p.requires_grad, self.audio_projection.parameters()))
+        
         optimizer = torch.optim.AdamW(trainable_modules, lr=self.learning_rate)
         return optimizer
     
 
     def on_save_checkpoint(self, checkpoint):
         checkpoint.clear()
-        trainable_param_names = list(filter(lambda named_param: named_param[1].requires_grad, self.pipe.denoising_model().named_parameters()))
-        trainable_param_names = set([named_param[0] for named_param in trainable_param_names])
-        state_dict = self.pipe.denoising_model().state_dict()
+        
+        # Save denoising model params
+        denoising_trainable_param_names = list(filter(
+            lambda named_param: named_param[1].requires_grad, 
+            self.pipe.denoising_model().named_parameters()
+        ))
+        denoising_trainable_param_names = set([named_param[0] for named_param in denoising_trainable_param_names])
+        
+        # Save audio projection params
+        audio_trainable_param_names = list(filter(
+            lambda named_param: named_param[1].requires_grad, 
+            self.audio_projection.named_parameters()
+        ))
+        audio_trainable_param_names = set([named_param[0] for named_param in audio_trainable_param_names])
+        
+        # Get state dicts
+        denoising_state_dict = self.pipe.denoising_model().state_dict()
+        audio_state_dict = self.audio_projection.state_dict()
+        
+        # Filter to only trainable params
         lora_state_dict = {}
-        for name, param in state_dict.items():
-            if name in trainable_param_names:
-                lora_state_dict[name] = param
+        for name, param in denoising_state_dict.items():
+            if name in denoising_trainable_param_names:
+                lora_state_dict[f"denoising_model.{name}"] = param
+                
+        for name, param in audio_state_dict.items():
+            if name in audio_trainable_param_names:
+                lora_state_dict[f"audio_projection.{name}"] = param
+                
         checkpoint.update(lora_state_dict)
 
 
@@ -716,8 +915,32 @@ def parse_args():
     parser.add_argument(
         "--save_every_n_steps",
         type=int,
-        default=50,
+        default=100,
         help="Save a checkpoint every N training steps",
+    )
+    parser.add_argument(
+        "--audio_embed_dim",
+        type=int,
+        default=4096,
+        help="Dimension of audio embeddings",
+    )
+    parser.add_argument(
+        "--audio_alpha",
+        type=float,
+        default=0.5,
+        help="Weight for the audio features in context fusion",
+    )
+    parser.add_argument(
+        "--audio_sample_rate",
+        type=int,
+        default=16000,
+        help="Sample rate for audio processing",
+    )
+    parser.add_argument(
+        "--freeze_feature_encoder",
+        action="store_true",
+        default=True,
+        help="Whether to freeze the feature encoder part of wav2vec",
     )
     args = parser.parse_args()
     return args
@@ -773,11 +996,12 @@ def train(args):
         steps_per_epoch=args.steps_per_epoch,
         lip_masks_path=args.lip_masks_path,
         frames=60,
+        audio_sample_rate=args.audio_sample_rate,
     )
     dataloader = torch.utils.data.DataLoader(
         dataset,
         shuffle=True,
-        batch_size=2,
+        batch_size=1,
         num_workers=args.dataloader_num_workers
     )
     model = LightningModelForTrain(
@@ -795,6 +1019,9 @@ def train(args):
         use_lip_weighted_loss=args.use_lip_weighted_loss,
         lip_alpha=args.lip_alpha,
         pixel_weight=args.pixel_weight,
+        audio_embed_dim=args.audio_embed_dim,
+        audio_alpha=args.audio_alpha,
+        freeze_feature_encoder=args.freeze_feature_encoder
     )
     loggers = []
 
