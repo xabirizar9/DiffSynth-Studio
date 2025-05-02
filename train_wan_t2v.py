@@ -334,10 +334,9 @@ class Wav2Vec2AudioProjection(nn.Module):
         self.wav2vec_model = Wav2Vec2Model.from_pretrained(wav2vec_model_name)
         
         # Freeze feature encoder (CNN part) but keep transformer trainable for fine-tuning
-        if freeze_feature_encoder:
-            for param in self.wav2vec_model.feature_extractor.parameters():
-                param.requires_grad = False
-        
+        self.wav2vec_model.requires_grad_(False)
+        self.wav2vec_model.eval()
+
         # Get wav2vec hidden dimension
         wav2vec_dim = self.wav2vec_model.config.hidden_size
         
@@ -349,15 +348,9 @@ class Wav2Vec2AudioProjection(nn.Module):
         )
         
     def forward(self, input_values):
-        # Extract features from wav2vec
-        feature_requires_grad = False
-        for param in self.wav2vec_model.feature_extractor.parameters():
-            if param.requires_grad:
-                feature_requires_grad = True
-                break
         
-        # If feature extractor is frozen, don't track gradients through it
-        with torch.set_grad_enabled(feature_requires_grad):
+        # Extract features from wav2vec
+        with torch.no_grad():
             wav2vec_outputs = self.wav2vec_model(
                 input_values.squeeze(1),
                 return_dict=True
@@ -365,12 +358,10 @@ class Wav2Vec2AudioProjection(nn.Module):
         
         # Get the hidden states from the last layer
         last_hidden_state = wav2vec_outputs.last_hidden_state  # [batch, seq_len, hidden_size]
-        
-        # Apply MLP projection
-        audio_embeddings = self.mlp(last_hidden_state)
-        
-        # Return proper shape: [batch_size, seq_len, embed_dim]
-        return audio_embeddings
+
+        out = self.mlp(last_hidden_state)
+
+        return out
 
 
 class LightningModelForTrain(pl.LightningModule):
@@ -386,7 +377,6 @@ class LightningModelForTrain(pl.LightningModule):
         lip_alpha=5.0,
         pixel_weight=0.1,
         audio_embed_dim=4096,  # Match the text embedding dimension
-        audio_alpha=0.5,
         freeze_feature_encoder=True
     ):
         super().__init__()
@@ -408,7 +398,6 @@ class LightningModelForTrain(pl.LightningModule):
             embed_dim=audio_embed_dim,
             freeze_feature_encoder=freeze_feature_encoder
         )
-        self.audio_alpha = audio_alpha
         
         self.freeze_parameters()
         
@@ -488,11 +477,9 @@ class LightningModelForTrain(pl.LightningModule):
             print(f"{num_updated_keys} parameters are loaded from {pretrained_lora_path}. {num_unexpected_keys} parameters are unexpected.")
     
     def process_audio_features(self, batch):
-        # Extract audio features from batch
-        audio_latents = batch["audio_latents"]
         
-        # Move to device and convert to float32 for processing
-        audio_latents = audio_latents.to(self.device, dtype=torch.float32)
+        # Extract audio features from batch
+        audio_latents = batch["audio_latents"].to(self.device)
         
         # Process through wav2vec audio projection model
         audio_embeddings = self.audio_projection(audio_latents)
@@ -510,8 +497,6 @@ class LightningModelForTrain(pl.LightningModule):
         if "y" in image_emb:
             image_emb["y"] = image_emb["y"][0].to(self.device)
         
-        # Process audio features
-        audio_embeddings = self.process_audio_features(batch)
         
         # Get lip mask if available
         lip_mask = batch.get("lip_mask", [None])[0]
@@ -530,23 +515,28 @@ class LightningModelForTrain(pl.LightningModule):
         training_target = self.scheduler.training_target(latents, noise, timestep)
 
         # Prepare model inputs
+        
+        # Get text context embeddings
+        text_context = prompt_emb["context"]  # [batch, seq_len, hidden_dim]
+
+        audio_embeddings = self.process_audio_features(batch)
+        B, N_audio, D = audio_embeddings.shape
+        B, N_text, D = text_context.shape
+
+        # Concatenate text and audio embeddings
+        combined_context = torch.cat([text_context, audio_embeddings], dim=1)
+
+        combined_context = audio_embeddings.new_empty(B, N_audio + N_text, D)
+        combined_context[:, ::2, :] = text_context
+        combined_context[:, 1::2, :] = audio_embeddings
+        
+        # Use combined context for cross-attention
         model_inputs = {
+            "context": combined_context,
             "timestep": timestep,
             **extra_input,
             **image_emb
         }
-        
-        # Get text context embeddings
-        text_context = prompt_emb["context"]  # [batch, seq_len, hidden_dim]
-        
-        # Apply weighting to audio embeddings to control their influence
-        audio_embeddings = audio_embeddings * self.audio_alpha
-        
-        # Concatenate text and audio embeddings along sequence length dimension
-        combined_context = torch.cat([text_context, audio_embeddings], dim=1)
-        
-        # Use combined context for cross-attention
-        model_inputs["context"] = combined_context
         
         # Compute noise prediction with combined context
         noise_pred = self.pipe.denoising_model()(
@@ -608,21 +598,6 @@ class LightningModelForTrain(pl.LightningModule):
             self.log("lip_loss", lip_loss.item(), prog_bar=True)
         else:
             loss = diff_loss
-
-        # Add a dummy regularization term to ensure all parameters are used
-        dummy_reg = 0.0
-        # Include denoising model parameters
-        for param in self.pipe.denoising_model().parameters():
-            if param.requires_grad:
-                dummy_reg = dummy_reg + 0.0 * param.sum()
-        
-        # Include audio projection parameters
-        for param in self.audio_projection.parameters():
-            if param.requires_grad:
-                dummy_reg = dummy_reg + 0.0 * param.sum()
-                
-        # Add the dummy regularization to the loss (has no effect on optimization)
-        loss = loss + dummy_reg
 
         # Record log
         self.log("train_loss", loss, prog_bar=True)
@@ -925,12 +900,6 @@ def parse_args():
         help="Dimension of audio embeddings",
     )
     parser.add_argument(
-        "--audio_alpha",
-        type=float,
-        default=0.5,
-        help="Weight for the audio features in context fusion",
-    )
-    parser.add_argument(
         "--audio_sample_rate",
         type=int,
         default=16000,
@@ -1020,7 +989,6 @@ def train(args):
         lip_alpha=args.lip_alpha,
         pixel_weight=args.pixel_weight,
         audio_embed_dim=args.audio_embed_dim,
-        audio_alpha=args.audio_alpha,
         freeze_feature_encoder=args.freeze_feature_encoder
     )
     loggers = []
